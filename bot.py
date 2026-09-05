@@ -47,7 +47,7 @@ VIDEO_BOT_TOKEN = os.environ["VIDEO_BOT_TOKEN"]
 VIDEO_BOT_USERNAME = os.getenv("VIDEO_BOT_USERNAME", "Viral_video99_bot").lstrip("@")
 OWNER_ID = int(os.environ["OWNER_ID"])
 STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
-DEFAULT_MINI_APP_URL = (os.getenv("MINI_APP_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+DEFAULT_MINI_APP_URL = (os.getenv("MINI_APP_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()
 DEFAULT_MENU_BUTTON_TEXT = os.getenv("MENU_BUTTON_TEXT", "🎬 Video open").strip() or "🎬 Video open"
 POLL_SECONDS = int(os.getenv("BROADCAST_POLL_SECONDS", "15"))
 MENU_SYNC_SECONDS = int(os.getenv("MENU_SYNC_SECONDS", "60"))
@@ -92,6 +92,29 @@ async def init_db():
                     PRIMARY KEY (bot_role, user_id)
                 )
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS video_join_channels (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT UNIQUE NOT NULL,
+                    title TEXT,
+                    join_url TEXT NOT NULL,
+                    enabled BOOLEAN DEFAULT TRUE,
+                    sort_order INTEGER DEFAULT 0,
+                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS notification_buttons (
+                    id BIGSERIAL PRIMARY KEY,
+                    button_text TEXT NOT NULL,
+                    button_url TEXT NOT NULL,
+                    enabled BOOLEAN DEFAULT TRUE,
+                    sort_order INTEGER DEFAULT 0,
+                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             for ddl in (
                 "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS video_access_title TEXT DEFAULT '🎁 Video Access'",
                 "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS video_access_instruction TEXT DEFAULT 'ভিডিওটি দেখার জন্য প্রয়োজনীয় Ad গুলো দেখুন'",
@@ -108,7 +131,12 @@ async def init_db():
                 "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS notification_bot_package_message TEXT DEFAULT '🔥 New Video Package\n\n📦 Package Name: {package_name}\n🎬 Total Video: {total_video}\n\nনতুন ভিডিও দেখতে নিচের বাটনে ক্লিক করুন 👇'",
                 "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS notification_bot_package_button_text TEXT DEFAULT '🎬 ভিডিও দেখুন'",
                 "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS channel_package_message TEXT DEFAULT '🔥 New Video Package\n\nPackage Name: {package_name}\n\nTotal Video: {total_video}'",
-                "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS channel_package_button_text TEXT DEFAULT 'ভিডিও দেখুন'"
+                "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS channel_package_button_text TEXT DEFAULT 'ভিডিও দেখুন'",
+                "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS mini_start_button_enabled BOOLEAN DEFAULT TRUE",
+                "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS mini_start_button_text TEXT DEFAULT '🚀 Mini Bot Start'",
+                "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS mini_start_text TEXT DEFAULT '👋 স্বাগতম! নতুন ভিডিও দেখতে Mini App খুলুন।'",
+                "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS loading_text TEXT DEFAULT 'VidUnlock Loading...'",
+                "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS loading_logo TEXT"
             ):
                 await conn.execute(ddl)
     await refresh_admin_cache()
@@ -184,7 +212,7 @@ async def get_settings():
     try:
         row = await db_fetchone("SELECT * FROM app_settings WHERE id='main' LIMIT 1")
         if row:
-            for key in ("protect_content", "maintenance_mode", "show_online", "tutorial_enabled", "comments_enabled", "reactions_enabled", "favorites_enabled", "profile_stats_enabled", "adsgram_enabled", "monetag_enabled", "welcome_manager_enabled", "join_request_welcome_enabled", "direct_join_welcome_enabled", "leave_inbox_enabled", "auto_approve_join_requests", "welcome_video_button_enabled", "welcome_start_button_enabled", "welcome_rejoin_button_enabled"):
+            for key in ("protect_content", "maintenance_mode", "show_online", "tutorial_enabled", "comments_enabled", "reactions_enabled", "favorites_enabled", "profile_stats_enabled", "adsgram_enabled", "monetag_enabled", "welcome_manager_enabled", "join_request_welcome_enabled", "direct_join_welcome_enabled", "leave_inbox_enabled", "auto_approve_join_requests", "welcome_video_button_enabled", "welcome_start_button_enabled", "welcome_rejoin_button_enabled", "mini_start_button_enabled"):
                 if key in row:
                     row[key] = bool(row[key])
             return row
@@ -244,6 +272,9 @@ async def get_settings():
         "notification_bot_package_button_text": "🎬 ভিডিও দেখুন",
         "channel_package_message": "🔥 New Video Package\n\nPackage Name: {package_name}\n\nTotal Video: {total_video}",
         "channel_package_button_text": "ভিডিও দেখুন",
+        "mini_start_button_enabled": True,
+        "mini_start_button_text": "🚀 Mini Bot Start",
+        "mini_start_text": "👋 স্বাগতম! নতুন ভিডিও দেখতে Mini App খুলুন।",
     }
 
 
@@ -324,7 +355,7 @@ def valid_webapp_url(url: str) -> bool:
 
 async def sync_menu_button(force_log: bool = False):
     settings = await get_settings()
-    url = (settings.get("web_app_url") or DEFAULT_MINI_APP_URL or "").strip()
+    url = _resolved_mini_app_url(settings)
     text = (settings.get("bot_menu_button_text") or DEFAULT_MENU_BUTTON_TEXT or "🎬 Video open").strip()[:64]
     if not valid_webapp_url(url):
         if force_log:
@@ -351,12 +382,33 @@ async def webapp_keyboard(settings=None):
     ]])
 
 
+def _resolved_mini_app_url(settings=None):
+    settings = settings or {}
+    candidates = [
+        (settings.get("web_app_url") or "").strip(),
+        (DEFAULT_MINI_APP_URL or "").strip(),
+    ]
+    for raw in candidates:
+        if not raw:
+            continue
+        url = raw
+        if "://" not in url:
+            url = "https://" + url.lstrip("/")
+        if valid_webapp_url(url):
+            return url
+    return ""
+
 async def mini_webapp_keyboard(settings=None):
     settings = settings or await get_settings()
-    url = (settings.get("web_app_url") or DEFAULT_MINI_APP_URL or "").strip()
+    url = _resolved_mini_app_url(settings)
     label = (settings.get("bot_menu_button_text") or DEFAULT_MENU_BUTTON_TEXT or "🎬 Video open").strip()[:64]
-    if valid_webapp_url(url):
+    if url:
         return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, web_app=WebAppInfo(url=url))]])
+    # Always keep a visible fallback button if the Mini Bot username is available.
+    if MINI_BOT_USERNAME:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=label, url=f"https://t.me/{MINI_BOT_USERNAME}?start=home")
+        ]])
     return None
 
 async def delete_later(chat_id: int, message_id: int, minutes: int):
@@ -470,7 +522,7 @@ async def deliver_video(message: Message, code: str):
         minutes = int(settings.get("auto_delete_minutes") or 20)
         notice = await message.answer(f"✅ ভিডিও পাঠানো হয়েছে।\n⏳ {minutes} মিনিট পরে ভিডিওটি অটোমেটিক ডিলিট হবে।")
         delete_at = utcnow_sql() + timedelta(minutes=max(1, minutes))
-        # Durable queue: survives Render restart/sleep and is processed again on startup.
+        # Durable queue: survives server restart/sleep and is processed again on startup.
         await db_execute(
             "INSERT INTO delete_queue(chat_id,message_id,delete_at,status,created_at) VALUES(%s,%s,%s,'pending',%s)",
             (message.chat.id, sent.message_id, delete_at, utcnow_sql()),
@@ -501,14 +553,15 @@ async def deliver_video(message: Message, code: str):
         await message.answer("❌ ভিডিও পাঠানো যায়নি। Storage Channel permission চেক করুন।")
 
 
-async def deliver_video_from_video_bot(message: Message, code: str):
+async def deliver_video_from_video_bot(message: Message, code: str, user_id: int | None = None):
+    uid = int(user_id or message.from_user.id)
     settings = await get_settings()
     rec = await lookup_video(code)
     if not rec:
         await message.answer("❌ এই ভিডিওটি পাওয়া যায়নি বা সরানো হয়েছে।")
         return
     try:
-        if await reset_expired_video_access(message.from_user.id, code, settings):
+        if await reset_expired_video_access(uid, code, settings):
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(
                     text="🔒 আবার Ad দেখে ভিডিও আনলক করুন",
@@ -542,12 +595,12 @@ async def deliver_video_from_video_bot(message: Message, code: str):
             )
         await db_execute(
             "INSERT INTO video_requests(user_id,video_code,delivered,created_at) VALUES(%s,%s,TRUE,%s)",
-            (message.from_user.id, code, utcnow_sql()),
+            (uid, code, utcnow_sql()),
         )
         pub = await db_fetchone("SELECT id FROM videos WHERE video_code=%s LIMIT 1", (code,))
         await db_execute(
             "INSERT INTO user_video_events(user_id,video_id,video_code,event_type,created_at) VALUES(%s,%s,%s,'delivered_video_bot',%s)",
-            (message.from_user.id, pub["id"] if pub else None, code, utcnow_sql()),
+            (uid, pub["id"] if pub else None, code, utcnow_sql()),
         )
         try:
             vcfg = await v20_video_buttons()
@@ -691,7 +744,11 @@ async def mini_bot_start_handler(message: Message):
     elif payload.startswith("welcome"):
         welcome = settings.get("join_welcome_text") or welcome
     kb = await mini_webapp_keyboard(settings)
-    # V21.1: Every Mini Bot /start refreshes the Tutorial card.
+    # V23: Every Mini Bot /start must show the Tutorial card, including
+    # package deep-links such as ?start=package_start.
+    if payload.startswith("package_start"):
+        welcome = (settings.get("mini_start_text") or welcome).strip()
+    # Every Mini Bot /start refreshes the Tutorial card.
     sent = await send_start_video(mini_bot, message, settings, "mini", reply_markup=kb, fallback_caption=welcome)
     if sent:
         return
@@ -705,6 +762,87 @@ async def mini_bot_private_handler(message: Message):
         await message.answer("🎬 Premium Video Gallery খুলুন", reply_markup=await mini_webapp_keyboard())
 
 
+
+def _member_status_value(member) -> str:
+    status = getattr(member, "status", "")
+    return str(getattr(status, "value", status) or "").lower()
+
+
+async def video_required_join_channels():
+    return await db_fetchall(
+        "SELECT id,chat_id,title,join_url,enabled,sort_order FROM video_join_channels "
+        "WHERE enabled=TRUE ORDER BY sort_order ASC,id ASC"
+    )
+
+
+async def video_missing_join_channels(user_id: int):
+    channels = await video_required_join_channels()
+    if not channels:
+        return []
+    missing = []
+    for ch in channels:
+        try:
+            member = await video_bot.get_chat_member(int(ch["chat_id"]), int(user_id))
+            status = _member_status_value(member)
+            joined = status in {"member", "administrator", "creator"}
+            if status == "restricted":
+                joined = bool(getattr(member, "is_member", False))
+            if not joined:
+                missing.append(ch)
+        except Exception as e:
+            log.warning("Video join verification failed chat=%s user=%s error=%s", ch.get("chat_id"), user_id, e)
+            missing.append(ch)
+    return missing
+
+
+def video_join_verify_keyboard(channels, code: str):
+    rows = []
+    for ch in channels:
+        title = str(ch.get("title") or "Channel").strip()
+        url = str(ch.get("join_url") or "").strip()
+        if url:
+            rows.append([InlineKeyboardButton(text=f"📢 {title} Join করুন"[:64], url=url)])
+    rows.append([InlineKeyboardButton(text="✅ Verification", callback_data=f"vj:{code}"[:64])])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def require_video_channel_join(message: Message, code: str, user_id: int | None = None) -> bool:
+    uid = int(user_id or message.from_user.id)
+    missing = await video_missing_join_channels(uid)
+    if not missing:
+        return True
+    await video_bot.send_message(
+        message.chat.id,
+        "🔐 ভিডিও দেখতে আগে নিচের Channel-এ Join করুন।\n\n"
+        "Join করার পরে ✅ Verification বাটনে চাপুন। Verification সফল হলে ভিডিওটি চলে আসবে।",
+        reply_markup=video_join_verify_keyboard(missing, code),
+        protect_content=True
+    )
+    return False
+
+
+@video_dp.callback_query(F.data.startswith("vj:"))
+async def video_join_verify_callback(query: CallbackQuery):
+    code = str(query.data or "")[3:].strip()
+    if not _tutorial_video_code(code):
+        await query.answer("ভিডিও কোড সঠিক নয়।", show_alert=True)
+        return
+    missing = await video_missing_join_channels(query.from_user.id)
+    if missing:
+        try:
+            await query.message.edit_reply_markup(reply_markup=video_join_verify_keyboard(missing, code))
+        except Exception:
+            pass
+        await query.answer("❌ এখনো সব Channel-এ Join করা হয়নি। Join করে আবার Verification চাপুন।", show_alert=True)
+        return
+    await query.answer("✅ Verification সফল")
+    try:
+        await query.message.edit_text("✅ Verification সফল। আপনার ভিডিও পাঠানো হচ্ছে…")
+    except Exception:
+        pass
+    await deliver_video_from_video_bot(query.message, code, user_id=query.from_user.id)
+
+
 @video_dp.message(CommandStart())
 async def video_bot_start_handler(message: Message):
     await save_video_bot_user(message)
@@ -712,7 +850,16 @@ async def video_bot_start_handler(message: Message):
     parts = (message.text or "").split(maxsplit=1)
     payload = parts[1].strip() if len(parts) > 1 else ""
 
-    # Always refresh the clean Tutorial card first.
+    # Video deep-link flow: Ads are completed in Mini App first, then Video Bot
+    # requires the admin-selected channel join verification before delivery.
+    code = _tutorial_video_code(payload)
+    if code:
+        if not await require_video_channel_join(message, code):
+            return
+        await deliver_video_from_video_bot(message, code)
+        return
+
+    # Normal /start keeps the tutorial card.
     await send_start_video(
         video_bot,
         message,
@@ -720,13 +867,6 @@ async def video_bot_start_handler(message: Message):
         "video",
         fallback_caption="🎬 ভিডিও দেখার নিয়ম"
     )
-
-    # A deep link such as https://t.me/Viral_video99_bot?start=video_105
-    # opens the protected video directly in Video Bot. No Ad UI is shown here.
-    code = _tutorial_video_code(payload)
-    if code:
-        await deliver_video_from_video_bot(message, code)
-        return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -749,6 +889,8 @@ async def video_bot_private_handler(message: Message):
     text = (message.text or "").strip()
     code = _tutorial_video_code(text)
     if code:
+        if not await require_video_channel_join(message, code):
+            return
         await deliver_video_from_video_bot(message, code)
 
 
@@ -1162,7 +1304,7 @@ async def broadcast_worker():
                     f"https://t.me/{MINI_BOT_USERNAME}?startapp={v.get('share_code')}"
                     if v.get('share_code') else None
                 )
-                other_package_url = "https://t.me/Bangladesh_vairal_videobot?start=start"
+                other_package_url = f"https://t.me/{MINI_BOT_USERNAME}?start=package_start"
 
                 if not mini_package_url:
                     continue
@@ -1181,11 +1323,28 @@ async def broadcast_worker():
                 package_name = v.get('title') or 'New Video'
                 ok = fail = 0
 
-                def package_keyboard(text_key, fallback, url):
+                custom_notification_buttons = await db_fetchall(
+                    "SELECT id,button_text,button_url FROM notification_buttons "
+                    "WHERE enabled=TRUE ORDER BY sort_order ASC,id ASC"
+                )
+
+                def package_keyboard(text_key, fallback, url, add_custom=False, add_mini_start=False):
                     label = (settings.get(text_key) or fallback).strip()[:64]
-                    return InlineKeyboardMarkup(inline_keyboard=[[
-                        InlineKeyboardButton(text=label, url=url)
-                    ]])
+                    rows = [[InlineKeyboardButton(text=label, url=url)]]
+                    if add_custom:
+                        for extra in custom_notification_buttons:
+                            bt = str(extra.get("button_text") or "").strip()[:64]
+                            bu = str(extra.get("button_url") or "").strip()
+                            if bt and bu:
+                                rows.append([InlineKeyboardButton(text=bt, url=bu)])
+                    if add_mini_start and settings.get("mini_start_button_enabled", True):
+                        start_label = (settings.get("mini_start_button_text") or "🚀 Mini Bot Start").strip()[:64]
+                        if start_label:
+                            rows.append([InlineKeyboardButton(
+                                text=start_label,
+                                url=f"https://t.me/{MINI_BOT_USERNAME}?start=package_start"
+                            )])
+                    return InlineKeyboardMarkup(inline_keyboard=rows)
 
                 async def send_text_only(client, uid, msg_key, btn_key):
                     text = _render_template(settings.get(msg_key), package_name=package_name, total_video=total_video)
@@ -1202,7 +1361,8 @@ async def broadcast_worker():
                     text = _render_template(settings.get(msg_key), package_name=package_name, total_video=total_video)
                     if not text.strip():
                         text = f"🔥 New Video Package\n\n📦 Package Name: {package_name}\n🎬 Total Video: {total_video}"
-                    kb2 = package_keyboard(btn_key, "🎬 ভিডিও দেখুন", other_package_url)
+                    # Video Bot + Notification Bot: existing package button + Mini Bot Start button below it.
+                    kb2 = package_keyboard(btn_key, "🎬 ভিডিও দেখুন", other_package_url, add_custom=True, add_mini_start=True)
                     thumb = v.get("thumb") or ""
                     if thumb.startswith("http://") or thumb.startswith("https://"):
                         await client.send_photo(uid, photo=thumb, caption=text, reply_markup=kb2, protect_content=True)
@@ -1253,9 +1413,13 @@ async def broadcast_worker():
                     if not ch_caption.strip():
                         ch_caption = f"🔥 New Video Package\n\n📦 Package Name: {package_name}\n🎬 Total Video: {total_video}"
                     ch_btn = (settings.get("channel_package_button_text") or "ভিডিও দেখুন").strip()[:64]
-                    ch_kb = InlineKeyboardMarkup(inline_keyboard=[[
-                        InlineKeyboardButton(text=ch_btn, url=other_package_url)
-                    ]])
+                    ch_kb = package_keyboard(
+                        "channel_package_button_text",
+                        "ভিডিও দেখুন",
+                        other_package_url,
+                        add_custom=True,
+                        add_mini_start=True
+                    )
                     thumb = v.get("thumb") or ""
                     for ch in channels:
                         chat_id = int(ch["chat_id"])
@@ -1731,7 +1895,7 @@ async def api_v20_admin_config(request):
     u=require_admin(request)
     uid=int(u['id'])
     if request.method=='GET':
-        return web.Response(text=json.dumps({'tutorial':await db_fetchone("SELECT * FROM tutorial_settings WHERE id='main'"),'wallet':await v20_wallet_settings(),'buttons':await v20_video_buttons(),'ads':await db_fetchone("SELECT * FROM ad_settings WHERE id='main'"),'texts':{k:(await get_settings()).get(k) for k in ('video_access_title','video_access_instruction','ad_progress_seen_text','ad_progress_remaining_text','ad_watch_button_text','all_ads_done_text','watch_video_button_text','video_access_secure_text','mini_bot_package_message','mini_bot_package_button_text','video_bot_package_message','video_bot_package_button_text','notification_bot_package_message','notification_bot_package_button_text','channel_package_message','channel_package_button_text')},'channels':await db_fetchall("SELECT * FROM notification_channels ORDER BY id"),'tasks':await db_fetchall("SELECT * FROM tasks ORDER BY id DESC"),'withdraws':await db_fetchall("SELECT * FROM withdraw_requests ORDER BY created_at DESC LIMIT 200") if (uid==OWNER_ID or has_perm(uid,'can_manage_withdraw')) else [],'is_owner':uid==OWNER_ID},default=str,ensure_ascii=False),content_type='application/json')
+        return web.Response(text=json.dumps({'tutorial':await db_fetchone("SELECT * FROM tutorial_settings WHERE id='main'"),'wallet':await v20_wallet_settings(),'buttons':await v20_video_buttons(),'ads':await db_fetchone("SELECT * FROM ad_settings WHERE id='main'"),'texts':{k:(await get_settings()).get(k) for k in ('video_access_title','video_access_instruction','ad_progress_seen_text','ad_progress_remaining_text','ad_watch_button_text','all_ads_done_text','watch_video_button_text','video_access_secure_text','mini_bot_package_message','mini_bot_package_button_text','video_bot_package_message','video_bot_package_button_text','notification_bot_package_message','notification_bot_package_button_text','channel_package_message','channel_package_button_text','mini_start_button_enabled','mini_start_button_text','mini_start_text')},'channels':await db_fetchall("SELECT * FROM notification_channels ORDER BY id"),'notification_buttons':await db_fetchall("SELECT * FROM notification_buttons ORDER BY sort_order ASC,id ASC"),'video_join_channels':await db_fetchall("SELECT * FROM video_join_channels ORDER BY sort_order ASC,id ASC"),'tasks':await db_fetchall("SELECT * FROM tasks ORDER BY id DESC"),'withdraws':await db_fetchall("SELECT * FROM withdraw_requests ORDER BY created_at DESC LIMIT 200") if (uid==OWNER_ID or has_perm(uid,'can_manage_withdraw')) else [],'is_owner':uid==OWNER_ID},default=str,ensure_ascii=False),content_type='application/json')
     d=await json_body(request); section=str(d.get('section') or '')
     if section=='tutorial':
         if not (uid==OWNER_ID or has_perm(uid,'can_manage_settings')): raise web.HTTPForbidden(text='Owner/Admin settings permission required')
@@ -1764,7 +1928,7 @@ async def api_v20_admin_config(request):
         vals=[d.get(k) for k in keys]; await db_execute('UPDATE video_buttons SET '+','.join(f'{k}=%s' for k in keys)+',updated_at=CURRENT_TIMESTAMP WHERE id=\'main\'',tuple(vals))
     elif section=='texts':
         if not (uid==OWNER_ID or has_perm(uid,'can_manage_settings') or has_perm(uid,'can_manage_notifications')): raise web.HTTPForbidden()
-        keys=('video_access_title','video_access_instruction','ad_progress_seen_text','ad_progress_remaining_text','ad_watch_button_text','all_ads_done_text','watch_video_button_text','video_access_secure_text','mini_bot_package_message','mini_bot_package_button_text','video_bot_package_message','video_bot_package_button_text','notification_bot_package_message','notification_bot_package_button_text','channel_package_message','channel_package_button_text')
+        keys=('video_access_title','video_access_instruction','ad_progress_seen_text','ad_progress_remaining_text','ad_watch_button_text','all_ads_done_text','watch_video_button_text','video_access_secure_text','mini_bot_package_message','mini_bot_package_button_text','video_bot_package_message','video_bot_package_button_text','notification_bot_package_message','notification_bot_package_button_text','channel_package_message','channel_package_button_text','mini_start_button_enabled','mini_start_button_text','mini_start_text')
         vals=[d.get(k) for k in keys]
         await db_execute('UPDATE app_settings SET '+','.join(f'{k}=%s' for k in keys)+',updated_at=CURRENT_TIMESTAMP WHERE id=\'main\'',tuple(vals))
     elif section=='ads':
@@ -1821,6 +1985,116 @@ async def _notification_channel_status(chat_id: int):
             "can_post_messages": False,
             "error": str(e),
         }
+
+
+
+async def _video_join_channel_status(chat_id: int):
+    """The Video Bot must be admin so getChatMember can verify arbitrary users reliably."""
+    try:
+        chat = await video_bot.get_chat(int(chat_id))
+        me = await video_bot.get_me()
+        member = await video_bot.get_chat_member(int(chat_id), me.id)
+        status = _member_status_value(member)
+        is_admin = status in {"administrator", "creator"}
+        return {
+            "ok": bool(is_admin),
+            "chat_id": int(chat_id),
+            "title": getattr(chat, "title", None),
+            "bot_status": status,
+            "error": None if is_admin else "Video Bot-কে এই Channel-এর Admin করুন"
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "chat_id": int(chat_id),
+            "title": None,
+            "bot_status": None,
+            "error": str(e)
+        }
+
+
+async def api_v20_admin_video_join_channels(request):
+    u = require_admin(request)
+    uid = int(u["id"])
+    if not (uid == OWNER_ID or has_perm(uid, "can_manage_notifications") or has_perm(uid, "can_manage_settings")):
+        raise web.HTTPForbidden(text="Join verification permission required")
+
+    if request.method == "POST":
+        d = await json_body(request)
+        try:
+            cid = int(str(d.get("chat_id") or "").strip())
+        except Exception:
+            raise web.HTTPBadRequest(text="Valid Channel ID দিন, যেমন -1001234567890")
+        join_url = str(d.get("join_url") or "").strip()
+        if not (join_url.startswith("https://t.me/") or join_url.startswith("http://t.me/")):
+            raise web.HTTPBadRequest(text="Channel Join Link দিন, যেমন https://t.me/yourchannel")
+        status = await _video_join_channel_status(cid)
+        title = str(d.get("title") or status.get("title") or cid).strip()
+        enabled = bool(status.get("ok"))
+        await db_execute(
+            "INSERT INTO video_join_channels(chat_id,title,join_url,enabled,sort_order) VALUES(%s,%s,%s,%s,%s) "
+            "ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title,join_url=EXCLUDED.join_url,"
+            "enabled=EXCLUDED.enabled,sort_order=EXCLUDED.sort_order,updated_at=CURRENT_TIMESTAMP",
+            (cid, title, join_url, enabled, int(d.get("sort_order") or 0))
+        )
+        return web.json_response({
+            "ok": bool(status.get("ok")),
+            "saved": True,
+            "channel": status,
+            "message": "Video Join Channel verified ✅" if status.get("ok") else status.get("error")
+        }, status=200 if status.get("ok") else 400)
+
+    await db_execute("DELETE FROM video_join_channels WHERE id=%s", (int(request.match_info["channel_id"]),))
+    return web.json_response({"ok": True})
+
+
+async def api_v20_admin_video_join_channel_test(request):
+    u = require_admin(request)
+    uid = int(u["id"])
+    if not (uid == OWNER_ID or has_perm(uid, "can_manage_notifications") or has_perm(uid, "can_manage_settings")):
+        raise web.HTTPForbidden()
+    row = await db_fetchone("SELECT * FROM video_join_channels WHERE id=%s", (int(request.match_info["channel_id"]),))
+    if not row:
+        raise web.HTTPNotFound(text="Join Channel not found")
+    status = await _video_join_channel_status(int(row["chat_id"]))
+    await db_execute(
+        "UPDATE video_join_channels SET enabled=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+        (bool(status.get("ok")), int(row["id"]))
+    )
+    if not status.get("ok"):
+        raise web.HTTPBadRequest(text=status.get("error") or "Video Bot admin verification failed")
+    return web.json_response({"ok": True, "channel": status})
+
+
+async def api_v20_admin_notification_buttons(request):
+    u = require_admin(request)
+    uid = int(u["id"])
+    if not (uid == OWNER_ID or has_perm(uid, "can_manage_notifications") or has_perm(uid, "can_manage_settings")):
+        raise web.HTTPForbidden(text="Notification settings permission required")
+    if request.method == "POST":
+        d = await json_body(request)
+        button_id = d.get("id")
+        text = str(d.get("button_text") or "").strip()[:64]
+        url = str(d.get("button_url") or "").strip()
+        enabled = bool(d.get("enabled", True))
+        sort_order = int(d.get("sort_order") or 0)
+        if not text:
+            raise web.HTTPBadRequest(text="Button text required")
+        if not (url.startswith("https://") or url.startswith("http://") or url.startswith("tg://")):
+            raise web.HTTPBadRequest(text="Valid button URL required")
+        if button_id:
+            await db_execute(
+                "UPDATE notification_buttons SET button_text=%s,button_url=%s,enabled=%s,sort_order=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+                (text, url, enabled, sort_order, int(button_id))
+            )
+            return web.json_response({"ok": True, "id": int(button_id)})
+        row = await db_fetchone(
+            "INSERT INTO notification_buttons(button_text,button_url,enabled,sort_order) VALUES(%s,%s,%s,%s) RETURNING id",
+            (text, url, enabled, sort_order)
+        )
+        return web.json_response({"ok": True, "id": int(row["id"])})
+    await db_execute("DELETE FROM notification_buttons WHERE id=%s", (int(request.match_info["button_id"]),))
+    return web.json_response({"ok": True})
 
 
 async def api_v20_admin_channels(request):
@@ -2020,9 +2294,11 @@ async def api_admin_settings_save(request):
         "join_welcome_text", "leave_inbox_text",
         "welcome_video_button_text", "welcome_video_button_url", "welcome_video_button_enabled",
         "welcome_start_button_text", "welcome_start_button_url", "welcome_start_button_enabled",
-        "welcome_rejoin_button_text", "welcome_rejoin_button_url", "welcome_rejoin_button_enabled"
+        "welcome_rejoin_button_text", "welcome_rejoin_button_url", "welcome_rejoin_button_enabled",
+        "mini_start_button_enabled", "mini_start_button_text", "mini_start_text",
+        "loading_text", "loading_logo"
     ]
-    bool_fields = {"show_online", "protect_content", "maintenance_mode", "tutorial_enabled", "comments_enabled", "reactions_enabled", "favorites_enabled", "profile_stats_enabled", "adsgram_enabled", "monetag_enabled", "welcome_manager_enabled", "join_request_welcome_enabled", "direct_join_welcome_enabled", "leave_inbox_enabled", "auto_approve_join_requests", "welcome_video_button_enabled", "welcome_start_button_enabled", "welcome_rejoin_button_enabled"}
+    bool_fields = {"show_online", "protect_content", "maintenance_mode", "tutorial_enabled", "comments_enabled", "reactions_enabled", "favorites_enabled", "profile_stats_enabled", "adsgram_enabled", "monetag_enabled", "welcome_manager_enabled", "join_request_welcome_enabled", "direct_join_welcome_enabled", "leave_inbox_enabled", "auto_approve_join_requests", "welcome_video_button_enabled", "welcome_start_button_enabled", "welcome_rejoin_button_enabled", "mini_start_button_enabled"}
 
     vals = []
     for f in fields:
@@ -2259,6 +2535,11 @@ async def start_web_server():
     app.router.add_post("/api/v20/admin/config", api_v20_admin_config)
     app.router.add_post("/api/v20/admin/tasks", api_v20_admin_tasks)
     app.router.add_delete("/api/v20/admin/tasks/{task_id}", api_v20_admin_tasks)
+    app.router.add_post("/api/v20/admin/video-join-channels", api_v20_admin_video_join_channels)
+    app.router.add_delete("/api/v20/admin/video-join-channels/{channel_id}", api_v20_admin_video_join_channels)
+    app.router.add_post("/api/v20/admin/video-join-channels/{channel_id}/test", api_v20_admin_video_join_channel_test)
+    app.router.add_post("/api/v20/admin/notification-buttons", api_v20_admin_notification_buttons)
+    app.router.add_delete("/api/v20/admin/notification-buttons/{button_id}", api_v20_admin_notification_buttons)
     app.router.add_post("/api/v20/admin/channels", api_v20_admin_channels)
     app.router.add_delete("/api/v20/admin/channels/{channel_id}", api_v20_admin_channels)
     app.router.add_post("/api/v20/admin/channels/{channel_id}/test", api_v20_admin_channel_test)
@@ -2319,7 +2600,7 @@ async def main():
     asyncio.create_task(delete_queue_worker())
     mini_poll = asyncio.create_task(mini_dp.start_polling(mini_bot, allowed_updates=["message"]))
     main_poll = asyncio.create_task(dp.start_polling(bot, allowed_updates=["message", "channel_post", "callback_query", "chat_join_request", "chat_member", "my_chat_member"]))
-    video_poll = asyncio.create_task(video_dp.start_polling(video_bot, allowed_updates=["message"]))
+    video_poll = asyncio.create_task(video_dp.start_polling(video_bot, allowed_updates=["message", "callback_query"]))
     try:
         await asyncio.gather(mini_poll, main_poll, video_poll)
     finally:
